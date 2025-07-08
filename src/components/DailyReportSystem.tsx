@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { MessageCircle, Clock, User, Building, FileText, Plus, Download, Calendar, BookOpen, BarChart3, Database } from 'lucide-react';
+import { MessageCircle, Clock, User, Building, FileText, Plus, Download, Calendar, BookOpen, BarChart3, Database, AlertCircle, Sparkles } from 'lucide-react';
 
 // データ型定義
 interface WorkHistory {
@@ -31,9 +31,196 @@ interface DailyReport {
   created_at: string;
 }
 
+// AI設定
+const GEMINI_API_KEY = process.env.REACT_APP_GEMINI_API_KEY;
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent';
+
 // Supabase設定（環境変数対応）
 const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL || 'https://byquekqumujmxgfrdppa.supabase.co';
 const SUPABASE_ANON_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ5cXVla3F1bXVqbXhnZnJkcHBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE5NTAwNDQsImV4cCI6MjA2NzUyNjA0NH0.GKXe3rsH3jAPADU00poZgYol_jxlZLc96qvCjZlZEr0';
+
+// AI APIクラス
+class GeminiAI {
+  private apiKey: string;
+  
+  constructor(apiKey: string) {
+    this.apiKey = apiKey;
+  }
+
+  async generateResponse(prompt: string): Promise<string> {
+    if (!this.apiKey) {
+      throw new Error('Gemini API キーが設定されていません');
+    }
+
+    try {
+      const response = await fetch(`${GEMINI_API_URL}?key=${this.apiKey}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: prompt
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024,
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(`API Error: ${response.status} - ${errorData.error?.message || response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      if (data.candidates && data.candidates[0] && data.candidates[0].content) {
+        return data.candidates[0].content.parts[0].text;
+      } else {
+        throw new Error('APIレスポンスが不正です');
+      }
+    } catch (error: any) {
+      console.error('Gemini API Error:', error);
+      throw error;
+    }
+  }
+}
+
+// AIアシスタントクラス
+class WorkHistoryAI {
+  private ai: GeminiAI;
+  
+  constructor() {
+    this.ai = new GeminiAI(GEMINI_API_KEY || '');
+  }
+
+  async getNextQuestion(step: number, previousAnswers: string[], currentAnswer?: string): Promise<string> {
+    const baseQuestions = [
+      "お疲れさまでした！今日の作業履歴を記録していきましょう。どちらの客先での作業が完了しましたか？",
+      "ありがとうございます。どのような種類の作業でしたか？（例：システム開発、保守作業、会議、調査など）",
+      "作業時間について教えてください。何時から何時まで作業されましたか？（例：9:00-17:00、14:30-16:45など）",
+      "作業の詳しい内容について教えてください。",
+      "今日の作業の成果はいかがでしたか？",
+      "作業中に感じた課題や問題点はありましたか？"
+    ];
+
+    if (step < baseQuestions.length) {
+      return baseQuestions[step];
+    }
+
+    // AIを使用してより自然な質問を生成
+    if (GEMINI_API_KEY) {
+      try {
+        const prompt = `
+あなたは作業履歴記録のアシスタントです。ユーザーから以下の情報を収集しています：
+
+これまでの回答:
+${previousAnswers.map((answer, index) => `${index + 1}. ${answer}`).join('\n')}
+
+現在の回答: ${currentAnswer || ''}
+
+次に聞くべき適切な質問を日本語で簡潔に（50文字以内）生成してください。
+親しみやすく、業務的すぎない口調でお願いします。`;
+
+        return await this.ai.generateResponse(prompt);
+      } catch (error) {
+        console.error('AI Question Generation Error:', error);
+      }
+    }
+
+    return baseQuestions[step % baseQuestions.length];
+  }
+
+  async generateDailySummary(histories: WorkHistory[]): Promise<string> {
+    if (!GEMINI_API_KEY || histories.length === 0) {
+      return "AI機能を使用するにはAPIキーの設定が必要です。または記録された履歴がありません。";
+    }
+
+    try {
+      const historyText = histories.map(h => 
+        `【${h.client_name}】${h.work_type} (${h.start_time}-${h.end_time}) - ${h.work_detail} | 成果: ${h.result}`
+      ).join('\n');
+
+      const prompt = `
+以下の作業履歴を基に、簡潔で具体的な日報サマリーを作成してください：
+
+${historyText}
+
+要件：
+- 200-300文字程度
+- 客先名と主要成果を明記
+- 業務報告に適した丁寧な文体
+- 箇条書きではなく文章形式
+- 具体的な数値や成果を強調`;
+
+      return await this.ai.generateResponse(prompt);
+    } catch (error: any) {
+      console.error('AI Summary Error:', error);
+      return `AIサマリー生成エラー: ${error.message}`;
+    }
+  }
+
+  async generateTomorrowGoals(histories: WorkHistory[], todaySummary: string): Promise<string> {
+    if (!GEMINI_API_KEY) {
+      return "明日の目標設定にはAPIキーが必要です。";
+    }
+
+    try {
+      const prompt = `
+本日の作業サマリー：
+${todaySummary}
+
+本日の作業詳細：
+${histories.map(h => `${h.client_name}: ${h.work_type} - ${h.issues || '課題なし'}`).join('\n')}
+
+上記を踏まえて、明日の具体的な目標を3つ提案してください：
+- 実行可能で測定可能な目標
+- 今日の課題を改善する内容
+- ビジネス価値を意識した目標
+- 各目標50文字以内`;
+
+      return await this.ai.generateResponse(prompt);
+    } catch (error: any) {
+      console.error('AI Tomorrow Goals Error:', error);
+      return `AI目標生成エラー: ${error.message}`;
+    }
+  }
+
+  async generateManagerReport(histories: WorkHistory[], summary: string): Promise<string> {
+    if (!GEMINI_API_KEY) {
+      return "管理者向けレポート作成にはAPIキーが必要です。";
+    }
+
+    try {
+      const totalHours = Math.floor(histories.reduce((sum, h) => sum + h.duration, 0) / 60);
+      const clientCount = new Set(histories.map(h => h.client_name)).size;
+
+      const prompt = `
+以下の情報から管理者向けの簡潔な報告を作成してください：
+
+作業サマリー: ${summary}
+総作業時間: ${totalHours}時間
+訪問客先数: ${clientCount}社
+
+要件：
+- 管理者が知りたい重要事項を優先
+- 150文字以内
+- 成果と課題を明確に分離
+- 必要に応じて数値を含める`;
+
+      return await this.ai.generateResponse(prompt);
+    } catch (error: any) {
+      console.error('AI Manager Report Error:', error);
+      return `AI管理者レポート生成エラー: ${error.message}`;
+    }
+  }
+}
 
 // Supabaseクライアント（本番対応版）
 const supabaseClient = {
@@ -112,6 +299,13 @@ const DailyReportSystem = () => {
   const [userEmail, setUserEmail] = useState('');
   const [storageMode, setStorageMode] = useState<'local' | 'supabase'>('local');
   const [connectionStatus, setConnectionStatus] = useState<'unknown' | 'success' | 'error'>('unknown');
+  
+  // AI関連の状態
+  const [aiAssistant] = useState(new WorkHistoryAI());
+  const [aiStatus, setAiStatus] = useState<'unknown' | 'available' | 'unavailable'>('unknown');
+  const [isAiProcessing, setIsAiProcessing] = useState(false);
+  const [conversationAnswers, setConversationAnswers] = useState<string[]>([]);
+  const [reportStep, setReportStep] = useState(0);
 
   // 初期化
   useEffect(() => {
@@ -122,7 +316,19 @@ const DailyReportSystem = () => {
       setUserEmail(email);
       loadData();
     }
+    
+    // AI可用性チェック
+    checkAIAvailability();
   }, [userName]);
+
+  // AI可用性チェック
+  const checkAIAvailability = () => {
+    if (GEMINI_API_KEY && GEMINI_API_KEY.length > 10) {
+      setAiStatus('available');
+    } else {
+      setAiStatus('unavailable');
+    }
+  };
 
   // データ読み込み
   const loadData = async () => {
@@ -171,10 +377,11 @@ const DailyReportSystem = () => {
     }
   };
 
-  // AI対話開始（簡易版）
+  // AI対話開始（改良版）
   const startAIRecording = async () => {
     setIsRecording(true);
     setConversationStep(0);
+    setConversationAnswers([]);
     setCurrentHistory({
       id: generateUUID(),
       date: new Date().toISOString().split('T')[0],
@@ -184,10 +391,15 @@ const DailyReportSystem = () => {
     });
     setMessages([]);
     
-    await addMessage("お疲れさまでした！今日の作業履歴を記録していきましょう。どちらの客先での作業が完了しましたか？", false);
+    try {
+      const firstQuestion = await aiAssistant.getNextQuestion(0, []);
+      await addMessage(firstQuestion, false);
+    } catch (error) {
+      await addMessage("お疲れさまでした！今日の作業履歴を記録していきましょう。どちらの客先での作業が完了しましたか？", false);
+    }
   };
 
-  // AI日報作成開始（簡易版）
+  // AI日報作成開始（改良版）
   const startAIReportCreation = async () => {
     if (histories.length === 0) {
       alert('日報を作成するには、先に履歴を記録してください。');
@@ -197,12 +409,36 @@ const DailyReportSystem = () => {
     setIsCreatingReport(true);
     setMessages([]);
     setActiveTab('report');
+    setReportStep(0);
     
+    setCurrentReport({
+      id: generateUUID(),
+      date: new Date().toISOString().split('T')[0],
+      user_name: userName,
+      related_history_ids: histories.map(h => h.id),
+      created_at: new Date().toISOString()
+    });
+
     const analysisMessage = generateHistoryAnalysis();
     await addMessage(analysisMessage, false);
     
     setTimeout(async () => {
-      await addMessage("それでは日報を作成していきましょう！今日一日を振り返って、全体的にはいかがでしたか？", false);
+      if (aiStatus === 'available') {
+        setIsAiProcessing(true);
+        try {
+          const aiSummary = await aiAssistant.generateDailySummary(histories);
+          await addMessage(`AIが分析した本日のサマリー：\n\n${aiSummary}`, false);
+          setTimeout(async () => {
+            await addMessage("この内容で問題なければ「OK」、修正したい場合は修正内容を教えてください。", false);
+          }, 1500);
+        } catch (error) {
+          await addMessage("AI分析でエラーが発生しました。手動で日報を作成していきましょう。今日一日を振り返って、全体的にはいかがでしたか？", false);
+        } finally {
+          setIsAiProcessing(false);
+        }
+      } else {
+        await addMessage("今日一日を振り返って、全体的にはいかがでしたか？", false);
+      }
     }, 1500);
   };
 
@@ -212,7 +448,7 @@ const DailyReportSystem = () => {
     const workTypes = [...new Set(histories.map(h => h.work_type))];
     const totalDuration = histories.reduce((sum, h) => sum + h.duration, 0);
     
-    return `今日は${clientNames.join('、')}で計${histories.length}件の作業がありましたね。\n${workTypes.join('、')}が中心で、総作業時間は${Math.floor(totalDuration/60)}時間${totalDuration%60}分でした。`;
+    return `📊 本日の作業分析結果：\n• 訪問客先: ${clientNames.join('、')} (${clientNames.length}社)\n• 作業種別: ${workTypes.join('、')}\n• 総作業時間: ${Math.floor(totalDuration/60)}時間${totalDuration%60}分\n• 記録件数: ${histories.length}件`;
   };
 
   // メッセージ追加
@@ -225,7 +461,7 @@ const DailyReportSystem = () => {
     });
   };
 
-  // ユーザー入力処理（簡易版）
+  // ユーザー入力処理（AI統合版）
   const handleUserInput = async () => {
     if (!userInput.trim()) return;
 
@@ -237,6 +473,9 @@ const DailyReportSystem = () => {
       const currentField = fields[conversationStep];
       
       const updatedHistory = { ...currentHistory };
+      const newAnswers = [...conversationAnswers, userInput];
+      setConversationAnswers(newAnswers);
+      
       if (currentField === 'start_time') {
         const timeMatch = userInput.match(/(\d{1,2}):?(\d{2})?\s*[-~〜]\s*(\d{1,2}):?(\d{2})?/);
         if (timeMatch) {
@@ -251,16 +490,27 @@ const DailyReportSystem = () => {
 
       if (conversationStep < fields.length - 1) {
         setConversationStep(conversationStep + 1);
-        const nextQuestions = [
-          "ありがとうございます。どのような種類の作業でしたか？",
-          "作業時間について教えてください。何時から何時まで作業されましたか？",
-          "作業の詳しい内容について教えてください。",
-          "今日の作業の成果はいかがでしたか？",
-          "作業中に感じた課題や問題点はありましたか？"
-        ];
-        setTimeout(async () => {
-          await addMessage(nextQuestions[conversationStep], false);
-        }, 1000);
+        setIsAiProcessing(true);
+        
+        try {
+          const nextQuestion = await aiAssistant.getNextQuestion(conversationStep + 1, newAnswers, userInput);
+          setTimeout(async () => {
+            await addMessage(nextQuestion, false);
+            setIsAiProcessing(false);
+          }, 1000);
+        } catch (error) {
+          const fallbackQuestions = [
+            "ありがとうございます。どのような種類の作業でしたか？",
+            "作業時間について教えてください。何時から何時まで作業されましたか？",
+            "作業の詳しい内容について教えてください。",
+            "今日の作業の成果はいかがでしたか？",
+            "作業中に感じた課題や問題点はありましたか？"
+          ];
+          setTimeout(async () => {
+            await addMessage(fallbackQuestions[conversationStep], false);
+            setIsAiProcessing(false);
+          }, 1000);
+        }
       } else {
         // 履歴記録完了
         const completedHistory = updatedHistory as WorkHistory;
@@ -271,14 +521,84 @@ const DailyReportSystem = () => {
         });
         
         setTimeout(async () => {
-          await addMessage(`記録が完了しました！${completedHistory.client_name}での${completedHistory.work_type}が保存されました。`, false);
+          await addMessage(`✅ 記録が完了しました！\n\n${completedHistory.client_name}での${completedHistory.work_type}が保存されました。`, false);
           setIsRecording(false);
           setConversationStep(0);
+          setConversationAnswers([]);
         }, 1000);
       }
     } else if (isCreatingReport) {
-      // 日報作成処理（簡易版）
-      await addMessage("ありがとうございます。続けて他の項目もお聞きしますね。", false);
+      // 日報作成処理（AI統合版）
+      if (reportStep === 0) {
+        // サマリー確認段階
+        if (userInput.toLowerCase().includes('ok') || userInput.includes('問題ない') || userInput.includes('大丈夫')) {
+          setCurrentReport(prev => ({ ...prev, daily_summary: messages.find(m => m.text.includes('AIが分析した'))?.text.split('：\n\n')[1] || '' }));
+          setReportStep(1);
+          
+          if (aiStatus === 'available') {
+            setIsAiProcessing(true);
+            try {
+              const tomorrowGoals = await aiAssistant.generateTomorrowGoals(histories, currentReport.daily_summary || '');
+              setTimeout(async () => {
+                await addMessage(`明日の目標提案：\n\n${tomorrowGoals}`, false);
+                await addMessage("この目標で問題なければ「OK」、修正したい場合は修正内容を教えてください。", false);
+                setIsAiProcessing(false);
+              }, 1000);
+            } catch (error) {
+              await addMessage("明日の目標を教えてください。", false);
+              setIsAiProcessing(false);
+            }
+          } else {
+            await addMessage("明日の目標を教えてください。", false);
+          }
+        } else {
+          setCurrentReport(prev => ({ ...prev, daily_summary: userInput }));
+          setReportStep(1);
+          await addMessage("ありがとうございます。では、明日の目標を教えてください。", false);
+        }
+      } else if (reportStep === 1) {
+        // 明日の目標設定段階
+        setCurrentReport(prev => ({ ...prev, tomorrow_goals: userInput }));
+        setReportStep(2);
+        
+        if (aiStatus === 'available') {
+          setIsAiProcessing(true);
+          try {
+            const managerReport = await aiAssistant.generateManagerReport(histories, currentReport.daily_summary || '');
+            setTimeout(async () => {
+              await addMessage(`管理者向けレポート案：\n\n${managerReport}`, false);
+              await addMessage("この内容で日報を完成させますか？「完成」で終了、修正があれば教えてください。", false);
+              setIsAiProcessing(false);
+            }, 1000);
+          } catch (error) {
+            await addMessage("最後に、管理者への報告事項があれば教えてください。", false);
+            setIsAiProcessing(false);
+          }
+        } else {
+          await addMessage("最後に、管理者への報告事項があれば教えてください。", false);
+        }
+      } else {
+        // 最終確認段階
+        if (userInput.includes('完成') || userInput.toLowerCase().includes('ok')) {
+          const completedReport: DailyReport = {
+            ...currentReport,
+            report_to_manager: currentReport.report_to_manager || messages.find(m => m.text.includes('管理者向けレポート'))?.text.split('：\n\n')[1] || ''
+          } as DailyReport;
+          
+          setDailyReports(prev => {
+            const newReports = [...prev, completedReport];
+            localStorage.setItem('daily_reports', JSON.stringify(newReports));
+            return newReports;
+          });
+          
+          await addMessage("🎉 日報が完成しました！お疲れさまでした。", false);
+          setIsCreatingReport(false);
+          setReportStep(0);
+        } else {
+          setCurrentReport(prev => ({ ...prev, report_to_manager: userInput }));
+          await addMessage("修正内容を反映しました。日報を完成させますか？「完成」で終了してください。", false);
+        }
+      }
     }
 
     setUserInput('');
@@ -330,6 +650,29 @@ const DailyReportSystem = () => {
     link.click();
   };
 
+  // AIステータス表示コンポーネント
+  const AIStatusIndicator = () => (
+    <div className={`flex items-center space-x-2 px-3 py-1 rounded-full text-sm ${
+      aiStatus === 'available' 
+        ? 'bg-green-100 text-green-800' 
+        : aiStatus === 'unavailable'
+        ? 'bg-red-100 text-red-800'
+        : 'bg-gray-100 text-gray-800'
+    }`}>
+      <div className={`w-2 h-2 rounded-full ${
+        aiStatus === 'available' ? 'bg-green-500' : 
+        aiStatus === 'unavailable' ? 'bg-red-500' : 'bg-gray-500'
+      }`}></div>
+      <span>
+        {aiStatus === 'available' ? 'Gemini AI 有効' : 
+         aiStatus === 'unavailable' ? 'AI 無効' : 'AI状態 確認中'}
+      </span>
+      {isAiProcessing && (
+        <div className="animate-spin w-3 h-3 border border-gray-400 border-t-transparent rounded-full"></div>
+      )}
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
       <div className="max-w-4xl mx-auto">
@@ -337,24 +680,51 @@ const DailyReportSystem = () => {
         <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3">
-              <FileText className="h-8 w-8 text-blue-600" />
+              <div className="flex items-center space-x-2">
+                <FileText className="h-8 w-8 text-blue-600" />
+                {aiStatus === 'available' && <Sparkles className="h-5 w-5 text-yellow-500" />}
+              </div>
               <div>
-                <h1 className="text-2xl font-bold text-gray-900">日報システム</h1>
-                <p className="text-gray-600">履歴記録機構 + 日報作成機構</p>
+                <h1 className="text-2xl font-bold text-gray-900">
+                  {aiStatus === 'available' ? 'AI日報システム' : '日報システム'}
+                </h1>
+                <p className="text-gray-600">
+                  {aiStatus === 'available' 
+                    ? 'Gemini AI搭載 履歴記録＋日報作成' 
+                    : '履歴記録機構 + 日報作成機構'
+                  }
+                </p>
               </div>
             </div>
-            <div className="flex items-center space-x-2 text-sm text-gray-500">
-              <User className="h-4 w-4" />
-              <span>{userName} ({userEmail})</span>
-              <span className={`px-2 py-1 rounded text-xs ${
-                storageMode === 'local' 
-                  ? 'bg-blue-100 text-blue-800' 
-                  : 'bg-green-100 text-green-800'
-              }`}>
-                {storageMode === 'local' ? 'ローカル保存' : 'Supabase連携'}
-              </span>
+            <div className="flex items-center space-x-3">
+              <AIStatusIndicator />
+              <div className="flex items-center space-x-2 text-sm text-gray-500">
+                <User className="h-4 w-4" />
+                <span>{userName} ({userEmail})</span>
+                <span className={`px-2 py-1 rounded text-xs ${
+                  storageMode === 'local' 
+                    ? 'bg-blue-100 text-blue-800' 
+                    : 'bg-green-100 text-green-800'
+                }`}>
+                  {storageMode === 'local' ? 'ローカル保存' : 'Supabase連携'}
+                </span>
+              </div>
             </div>
           </div>
+          
+          {/* AI設定警告 */}
+          {aiStatus === 'unavailable' && (
+            <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <div className="flex items-center space-x-2 text-yellow-800">
+                <AlertCircle className="h-5 w-5" />
+                <span className="font-medium">🚀 AI機能を有効にして体験をアップグレード！</span>
+              </div>
+              <div className="mt-2 text-sm text-yellow-700">
+                <p><strong>手順：</strong> 1) Google AI StudioでGemini APIキー取得 → 2) Vercel環境変数「REACT_APP_GEMINI_API_KEY」設定 → 3) 再デプロイ</p>
+                <p><strong>メリット：</strong> より自然な対話、自動サマリー生成、スマートな提案機能</p>
+              </div>
+            </div>
+          )}
           
           {/* タブ */}
           <div className="flex space-x-1 mt-6 bg-gray-100 p-1 rounded-lg">
@@ -368,6 +738,7 @@ const DailyReportSystem = () => {
             >
               <Clock className="h-4 w-4" />
               <span>履歴記録</span>
+              {aiStatus === 'available' && <Sparkles className="h-3 w-3 text-yellow-500" />}
             </button>
             <button
               onClick={() => setActiveTab('report')}
@@ -379,6 +750,7 @@ const DailyReportSystem = () => {
             >
               <BookOpen className="h-4 w-4" />
               <span>日報作成</span>
+              {aiStatus === 'available' && <Sparkles className="h-3 w-3 text-yellow-500" />}
             </button>
             <button
               onClick={() => setActiveTab('deploy')}
@@ -400,14 +772,22 @@ const DailyReportSystem = () => {
             <div className="bg-white rounded-lg shadow-lg p-6">
               <div className="flex items-center space-x-2 mb-4">
                 <MessageCircle className="h-5 w-5 text-blue-600" />
-                <h2 className="text-lg font-semibold text-gray-900">AI対話による履歴記録</h2>
+                <h2 className="text-lg font-semibold text-gray-900">
+                  {aiStatus === 'available' ? 'Gemini AI対話による履歴記録' : 'AI対話による履歴記録'}
+                </h2>
+                {aiStatus === 'available' && <Sparkles className="h-4 w-4 text-yellow-500" />}
               </div>
 
               {/* メッセージエリア */}
               <div className="h-64 overflow-y-auto border border-gray-200 rounded-lg p-4 mb-4 bg-gray-50">
                 {messages.length === 0 && !isRecording && (
                   <div className="text-center text-gray-500 mt-20">
-                    <div className="mb-2">AI対話機能で自然な履歴記録をサポート</div>
+                    <div className="mb-2">
+                      {aiStatus === 'available' 
+                        ? '🤖 Gemini AIが自然な対話で履歴記録をサポート' 
+                        : 'AI対話機能で自然な履歴記録をサポート'
+                      }
+                    </div>
                     <div className="text-sm">「AI対話で履歴記録」をクリックして開始しましょう</div>
                   </div>
                 )}
@@ -422,6 +802,14 @@ const DailyReportSystem = () => {
                     </div>
                   </div>
                 ))}
+                {isAiProcessing && (
+                  <div className="text-center">
+                    <div className="inline-flex items-center space-x-2 text-gray-500">
+                      <div className="animate-spin w-4 h-4 border border-gray-400 border-t-transparent rounded-full"></div>
+                      <span className="text-sm">AIが回答を生成中...</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* 入力エリア */}
@@ -431,13 +819,15 @@ const DailyReportSystem = () => {
                     type="text"
                     value={userInput}
                     onChange={(e) => setUserInput(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && handleUserInput()}
+                    onKeyPress={(e) => e.key === 'Enter' && !isAiProcessing && handleUserInput()}
                     placeholder="回答を入力してください..."
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    disabled={isAiProcessing}
+                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                   />
                   <button
                     onClick={handleUserInput}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                    disabled={isAiProcessing}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-400"
                   >
                     送信
                   </button>
@@ -448,10 +838,17 @@ const DailyReportSystem = () => {
               {!isRecording && (
                 <button
                   onClick={startAIRecording}
-                  className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-r from-green-600 to-blue-600 text-white rounded-md hover:from-green-700 hover:to-blue-700"
+                  className={`w-full flex items-center justify-center space-x-2 px-4 py-3 text-white rounded-md ${
+                    aiStatus === 'available' 
+                      ? 'bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700' 
+                      : 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700'
+                  }`}
                 >
                   <MessageCircle className="h-5 w-5" />
-                  <span>AI対話で履歴記録</span>
+                  <span>
+                    {aiStatus === 'available' ? 'Gemini AI対話で履歴記録' : 'AI対話で履歴記録'}
+                  </span>
+                  {aiStatus === 'available' && <Sparkles className="h-4 w-4" />}
                 </button>
               )}
             </div>
@@ -511,15 +908,25 @@ const DailyReportSystem = () => {
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center space-x-2">
                   <MessageCircle className="h-5 w-5 text-purple-600" />
-                  <h2 className="text-lg font-semibold text-gray-900">AI日報作成</h2>
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    {aiStatus === 'available' ? 'Gemini AI日報作成' : 'AI日報作成'}
+                  </h2>
+                  {aiStatus === 'available' && <Sparkles className="h-4 w-4 text-yellow-500" />}
                 </div>
                 {histories.length > 0 && !isCreatingReport && (
                   <button
                     onClick={startAIReportCreation}
-                    className="flex items-center space-x-2 px-3 py-2 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-md hover:from-purple-700 hover:to-blue-700 text-sm"
+                    className={`flex items-center space-x-2 px-3 py-2 text-white rounded-md text-sm ${
+                      aiStatus === 'available' 
+                        ? 'bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700' 
+                        : 'bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700'
+                    }`}
                   >
                     <MessageCircle className="h-4 w-4" />
-                    <span>AI日報作成</span>
+                    <span>
+                      {aiStatus === 'available' ? 'Gemini AI日報作成' : 'AI日報作成'}
+                    </span>
+                    {aiStatus === 'available' && <Sparkles className="h-3 w-3" />}
                   </button>
                 )}
               </div>
@@ -530,6 +937,8 @@ const DailyReportSystem = () => {
                   <div className="text-center text-gray-500 mt-20">
                     {histories.length === 0 
                       ? '履歴を記録してからAI日報作成を開始してください' 
+                      : aiStatus === 'available'
+                      ? '🤖 Gemini AIが履歴を分析して日報を自動生成'
                       : 'AI対話による日報作成をサポート'
                     }
                   </div>
@@ -545,6 +954,14 @@ const DailyReportSystem = () => {
                     </div>
                   </div>
                 ))}
+                {isAiProcessing && (
+                  <div className="text-center">
+                    <div className="inline-flex items-center space-x-2 text-gray-500">
+                      <div className="animate-spin w-4 h-4 border border-gray-400 border-t-transparent rounded-full"></div>
+                      <span className="text-sm">AIが日報を生成中...</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* 入力エリア */}
@@ -554,13 +971,15 @@ const DailyReportSystem = () => {
                     type="text"
                     value={userInput}
                     onChange={(e) => setUserInput(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && handleUserInput()}
+                    onKeyPress={(e) => e.key === 'Enter' && !isAiProcessing && handleUserInput()}
                     placeholder="回答を入力してください..."
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    disabled={isAiProcessing}
+                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:bg-gray-100"
                   />
                   <button
                     onClick={handleUserInput}
-                    className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700"
+                    disabled={isAiProcessing}
+                    className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:bg-gray-400"
                   >
                     送信
                   </button>
@@ -587,6 +1006,12 @@ const DailyReportSystem = () => {
                           <Calendar className="h-4 w-4 text-gray-500" />
                           <span className="font-medium text-gray-900">{report.date}</span>
                         </div>
+                        {aiStatus === 'available' && (
+                          <span className="flex items-center space-x-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded">
+                            <Sparkles className="h-3 w-3" />
+                            <span>AI生成</span>
+                          </span>
+                        )}
                       </div>
                       <div className="text-sm text-gray-600">
                         <div><span className="font-medium">総括：</span>{report.daily_summary}</div>
@@ -669,7 +1094,12 @@ const DailyReportSystem = () => {
                   <div className="text-sm text-blue-800 space-y-1">
                     <div>✅ SUPABASE_URL: 設定済み</div>
                     <div>✅ SUPABASE_ANON_KEY: 設定済み</div>
-                    <div>⚠️ GEMINI_API_KEY: 未設定（モック機能で動作）</div>
+                    <div className={aiStatus === 'available' ? 'text-green-800' : 'text-yellow-800'}>
+                      {aiStatus === 'available' 
+                        ? '✅ GEMINI_API_KEY: 設定済み（AI機能有効）' 
+                        : '⚠️ GEMINI_API_KEY: 未設定（基本機能で動作）'
+                      }
+                    </div>
                   </div>
                 </div>
               </div>
@@ -703,9 +1133,11 @@ const DailyReportSystem = () => {
                     <li>☑️ Reactアプリ正常動作</li>
                     <li>☑️ Tailwind CSS適用確認</li>
                     <li>☑️ 基本機能動作確認</li>
-                    <li>⬜ GitHubリポジトリ作成</li>
-                    <li>⬜ Vercelデプロイ設定</li>
-                    <li>⬜ 環境変数設定</li>
+                    <li>☑️ GitHubリポジトリ作成</li>
+                    <li>☑️ Vercelデプロイ設定</li>
+                    <li className={aiStatus === 'available' ? 'text-green-800' : ''}>
+                      {aiStatus === 'available' ? '☑️' : '⬜'} AI環境変数設定
+                    </li>
                   </ul>
                 </div>
 
@@ -714,7 +1146,10 @@ const DailyReportSystem = () => {
                     🎯 次のステップ
                   </h3>
                   <div className="text-sm text-blue-800">
-                    ローカル環境での動作確認が完了したら、GitHub→Vercel公開に進めます！
+                    {aiStatus === 'available' 
+                      ? '🎉 AI機能付き完全版として運用開始可能！さらなる機能拡張も検討できます。'
+                      : 'ローカル環境での動作確認完了。AI機能追加でさらに高機能化可能！'
+                    }
                   </div>
                 </div>
               </div>
@@ -727,6 +1162,12 @@ const DailyReportSystem = () => {
           <div className="flex items-center space-x-2 mb-4">
             <BarChart3 className="h-5 w-5 text-blue-600" />
             <h2 className="text-lg font-semibold text-gray-900">本日の統計</h2>
+            {aiStatus === 'available' && (
+              <span className="flex items-center space-x-1 text-xs text-green-600 bg-green-50 px-2 py-1 rounded">
+                <Sparkles className="h-3 w-3" />
+                <span>AI分析対応</span>
+              </span>
+            )}
           </div>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
             <div className="text-center">
